@@ -1,72 +1,72 @@
 export const config = { runtime: "edge" };
 
-const TARGETS = [
-  process.env.TARGET_DOMAIN_1,
-  process.env.TARGET_DOMAIN_2,
-  process.env.TARGET_DOMAIN_3,
-].map(t => (t ?? "").replace(/\/+$/, "")).filter(Boolean);
+const upstream = (process.env.TARGET_DOMAIN ?? "").replace(/\/+$/, "");
 
-const SKIP = new Set([
-  "host", "connection", "keep-alive",
-  "proxy-authenticate", "proxy-authorization",
-  "te", "trailer", "transfer-encoding", "upgrade",
-  "forwarded", "x-forwarded-host", "x-forwarded-proto", "x-forwarded-port",
+const dropHeaders = new Set([
+  "host",
+  "connection",
+  "keep-alive",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+  "forwarded",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "x-forwarded-host",
+  "x-forwarded-proto",
+  "x-forwarded-port",
 ]);
 
-function buildUrl(base, reqUrl) {
-  const i = reqUrl.indexOf("/", 8);
-  return i === -1 ? `${base}/` : `${base}${reqUrl.slice(i)}`;
+function resolveTarget(base, incoming) {
+  const cut = incoming.indexOf("/", 8);
+  return cut === -1 ? `${base}/` : `${base}${incoming.slice(cut)}`;
 }
 
-function cloneHeaders(src) {
-  const headers = new Headers();
-  let ip = "";
-  for (const [k, v] of src) {
-    if (k.startsWith("x-vercel-")) continue;
-    if (SKIP.has(k)) continue;
-    if (k === "x-real-ip") { ip = v; continue; }
-    if (k === "x-forwarded-for") { if (!ip) ip = v; continue; }
-    headers.set(k, v);
+function prepareHeaders(source) {
+  const result = new Headers();
+  let clientIp = "";
+
+  for (const [key, val] of source) {
+    if (key.startsWith("x-vercel-")) continue;
+    if (dropHeaders.has(key)) continue;
+    if (key === "x-real-ip") { clientIp = val; continue; }
+    if (key === "x-forwarded-for") { if (!clientIp) clientIp = val; continue; }
+    result.set(key, val);
   }
-  if (ip) headers.set("x-forwarded-for", ip);
-  return headers;
+
+  if (clientIp) result.set("x-forwarded-for", clientIp);
+  return result;
 }
 
 export default async function handler(req) {
-  if (!TARGETS.length) {
-    return new Response("Misconfigured: no TARGET_DOMAIN set", { status: 500 });
+  if (!upstream) {
+    return new Response("Misconfigured: TARGET_DOMAIN is not set", { status: 500 });
   }
 
-  const headers = cloneHeaders(req.headers);
-  const hasBody = req.method !== "GET" && req.method !== "HEAD";
-  const bodyBuffer = hasBody ? await req.arrayBuffer() : null;
+  try {
+    const abort = new AbortController();
+    const watchdog = setTimeout(() => abort.abort(), 10_000);
+    const sendBody = req.method !== "GET" && req.method !== "HEAD";
 
-  for (let i = 0; i < TARGETS.length; i++) {
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 10_000);
+    const response = await fetch(resolveTarget(upstream, req.url), {
+      method: req.method,
+      headers: prepareHeaders(req.headers),
+      body: sendBody ? req.body : undefined,
+      duplex: "half",
+      redirect: "manual",
+      signal: abort.signal,
+    });
 
-      const res = await fetch(buildUrl(TARGETS[i], req.url), {
-        method: req.method,
-        headers,
-        body: bodyBuffer ?? undefined,
-        duplex: "half",
-        redirect: "manual",
-        signal: controller.signal,
-      });
+    clearTimeout(watchdog);
+    return response;
 
-      clearTimeout(timer);
-      return res;
-
-    } catch (err) {
-      console.warn(`Server ${i + 1} failed (${TARGETS[i]}):`, err?.message);
-      if (i === TARGETS.length - 1) {
-        const timedOut = err?.name === "AbortError";
-        return new Response(
-          timedOut ? "Gateway Timeout" : "Bad Gateway: All servers failed",
-          { status: timedOut ? 504 : 502 }
-        );
-      }
-    }
+  } catch (e) {
+    const isTimeout = e?.name === "AbortError";
+    console.error("relay error:", e?.message);
+    return new Response(
+      isTimeout ? "Gateway Timeout" : "Bad Gateway: Tunnel Failed",
+      { status: isTimeout ? 504 : 502 }
+    );
   }
 }
